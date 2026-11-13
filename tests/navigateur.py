@@ -74,15 +74,24 @@ async def ouvrir(largeur=1400, hauteur=1000):
     if os.environ.get("DICTEE_WAV"):  # faux micro qui « parle » le contenu de ce fichier
         micro = ["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream",
                  f"--use-file-for-fake-audio-capture={os.environ['DICTEE_WAV']}"]
+    try:  # un Chrome de test resté ouvert servirait d'anciens fichiers : on refuse plutôt que de tester du périmé
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=1)
+        raise RuntimeError(f"Un Chrome de test tourne déjà sur le port {port} : pkill -f remote-debugging-port={port}")
+    except OSError:
+        pass
     p = subprocess.Popen([CHROME, "--headless=new", "--disable-gpu", f"--remote-debugging-port={port}", f"--user-data-dir={profil}",
                           f"--window-size={largeur},{hauteur}", *micro, "about:blank"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(50):
+    cible = None
+    for _ in range(100):
         try:
             cibles = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json"))
             cible = next(c for c in cibles if c["type"] == "page")
             break
         except Exception:
             time.sleep(0.2)
+    if cible is None:
+        p.terminate()  # sinon ce Chrome resterait ouvert et fausserait les essais suivants
+        raise RuntimeError("Chrome de test n'a pas démarré à temps.")
     ws = await websockets.connect(cible["webSocketDebuggerUrl"], max_size=50_000_000)
     page = Page(ws)
     await page.cmd("Runtime.enable")
@@ -270,7 +279,7 @@ async def principal(scenario, sortie):
                 await page.capture(f"{sortie}/page-{nom}.png")
             await page.aller(BASE + "#/nouvelle/Dashboard_Claude")
             await page.attendre("document.querySelector('.etat-conv').innerText.includes('Prêt')", 15)
-            rapport["dossier_choisi"] = await page.js("document.querySelector('select.puce').selectedOptions[0].textContent")
+            rapport["dossier_choisi"] = await page.js("document.querySelector('select.choix-dossier').selectedOptions[0].textContent")
             await page.capture(f"{sortie}/nouvelle-projet.png")
         elif scenario == "taches":
             await page.aller(BASE + "#/taches")
@@ -321,11 +330,59 @@ async def principal(scenario, sortie):
             await page.aller(BASE + "#/nouvelle")  # même document : l'espion reste en place
             await page.attendre("document.querySelector('.etat-conv').innerText.includes('Prêt')", 15)
             await page.js("document.hasFocus = () => false")  # L'utilisateur regarde une autre fenêtre
-            await page.js("const t=document.getElementById('texte'); t.value='Réponds seulement : bonjour.'; t.dispatchEvent(new Event('input')); t.form.requestSubmit()")
+            await page.js("{ const t=document.getElementById('texte'); t.value='Réponds seulement : bonjour.'; t.dispatchEvent(new Event('input')); t.form.requestSubmit() }")
             await page.attendre("document.querySelector('.etat-conv').innerText.includes('Prêt') && document.querySelector('.reponse:not(.curseur)')", 120)
             await asyncio.sleep(0.5)
             rapport["apres_reponse"] = await page.js("window.__notifs.slice(1)")
             rapport["icone_servie"] = await page.js("fetch('/web/icone-192.png').then(r => r.ok && r.headers.get('content-type'))")
+        elif scenario == "quitter":
+            # Bugs signalés le 13/11 : le message envoyé revenait dans la saisie ; quitter avant la réponse la perdait.
+            await page.aller(BASE + "#/nouvelle")
+            await page.attendre("document.querySelector('.etat-conv').innerText.includes('Prêt')", 15)
+            demande = "Sans outil, écris les nombres de un à quatre-vingts en toutes lettres, un par ligne, rien d'autre."
+            await page.js(f"const t=document.getElementById('texte'); t.value={json.dumps(demande)}; t.dispatchEvent(new Event('input')); t.form.requestSubmit()")
+            await page.attendre("location.hash.startsWith('#/conversation/')", 60)
+            lien = await page.js("location.hash")
+            await asyncio.sleep(2)
+            await page.aller(BASE + "#/historique")   # on quitte avant la fin de la réponse
+            await asyncio.sleep(3)
+            await page.aller(BASE + lien)             # on revient
+            await page.attendre("document.getElementById('texte')", 15)
+            rapport["saisie_au_retour"] = await page.js("document.getElementById('texte').value")
+            await asyncio.sleep(1)
+            rapport["etat_au_retour"] = await page.js("document.querySelector('.etat-conv').innerText")
+            await page.attendre("document.querySelector('.etat-conv').innerText.includes('Prêt') && document.querySelector('.reponse, .claude') && !document.querySelector('.curseur')", 180)
+            await asyncio.sleep(1)
+            rapport["bulles_du_message"] = await page.js(f"[...document.querySelectorAll('.bulle-moi')].filter(b => b.textContent === {json.dumps(demande)}).length")
+            rapport["fin_de_reponse"] = await page.js("[...document.querySelectorAll('.claude .corps, .claude')].pop().innerText.slice(-60)")
+            await page.capture(f"{sortie}/quitter-retour.png")
+            await page.aller(BASE + "#/nouvelle")
+            await page.attendre("document.getElementById('texte')", 15)
+            rapport["saisie_nouvelle_conversation"] = await page.js("document.getElementById('texte').value")
+        elif scenario == "modele":
+            await page.aller(BASE + "#/nouvelle")
+            await page.attendre("document.querySelector('.etat-conv').innerText.includes('Prêt')", 15)
+            await page.attendre("[...document.querySelector('select[aria-label=\"Modèle de Claude\"]').options].some(o => o.value === 'haiku')", 60)
+            rapport["modeles"] = await page.js("[...document.querySelector('select[aria-label=\"Modèle de Claude\"]').options].map(o => o.textContent)")
+            await page.js("const s=document.querySelector('select[aria-label=\"Modèle de Claude\"]'); s.value='haiku'; s.dispatchEvent(new Event('change'))")
+            # Maj+Tab dans la zone de saisie : Demander → Modifs auto → Plan
+            for _ in range(2):
+                await page.js("document.getElementById('texte').dispatchEvent(new KeyboardEvent('keydown', {key: 'Tab', shiftKey: true, bubbles: true}))")
+                await asyncio.sleep(0.3)
+            rapport["mode"] = await page.js("document.querySelector('select[aria-label=\"Mode de Claude\"]').value")
+            await page.js("{ const t=document.getElementById('texte'); t.value='Crée le fichier essai-plan.txt dans le dossier courant avec le mot bonjour.'; t.dispatchEvent(new Event('input')); t.form.requestSubmit() }")
+            await page.attendre("document.querySelector('.accord .btns') || (document.querySelector('.etat-conv').innerText.includes('Prêt') && !document.querySelector('.curseur'))", 180)
+            rapport["carte"] = await page.js("document.querySelector('.accord')?.innerText.slice(0, 200) || null")
+            await page.capture(f"{sortie}/mode-plan.png")
+            if rapport["carte"]:
+                await page.js("[...document.querySelectorAll('.accord .bouton')].find(b => b.textContent === 'Refuser').click()")
+            await page.attendre("document.querySelector('.etat-conv').innerText.includes('Prêt') && !document.querySelector('.curseur')", 180)
+            rapport["fichier_cree"] = os.path.exists(os.path.expanduser("~/essai-plan.txt"))
+            await page.js("{ const t=document.getElementById('texte'); t.value='En une phrase : quel modèle Claude es-tu exactement ?'; t.dispatchEvent(new Event('input')); t.form.requestSubmit() }")
+            await page.attendre("document.querySelector('.etat-conv').innerText.includes('Prêt') && !document.querySelector('.curseur')", 180)
+            rapport["reponse_modele"] = await page.js("[...document.querySelectorAll('.reponse')].pop().innerText")
+            rapport["modele_affiche"] = await page.js("[...document.querySelectorAll('.claude .nom small')].pop().textContent")
+            await page.capture(f"{sortie}/modele.png")
         rapport["erreurs_js"] = page.erreurs
     except Exception as e:
         rapport["echec"] = repr(e)

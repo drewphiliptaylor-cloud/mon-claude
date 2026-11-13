@@ -361,3 +361,8 @@ kbd { font-family:inherit; font-size:var(--t13); padding:2px 8px; border-radius:
   .grille { grid-template-columns:repeat(2, calc((100cqw - var(--gouttiere)) / 2)); grid-auto-rows:calc((100cqw - var(--gouttiere)) / 2); }
   .w.XL { grid-column:span 2; }
 }
+/* ---------- modèle et mode d'une conversation ---------- */
+.reglage-conv { border:0; font:inherit; font-size:var(--t11); cursor:pointer; max-width:16ch; }
+.reglage-conv:focus-visible { outline:2px solid var(--ambre); outline-offset:2px; }
+.reglage-conv[data-mode="acceptEdits"], .reglage-conv[data-mode="auto"] { background:color-mix(in srgb, var(--ambre) 22%, transparent); color:var(--texte); }
+.reglage-conv[data-mode="plan"] { background:color-mix(in srgb, var(--acc-clair) 30%, transparent); color:var(--texte); }

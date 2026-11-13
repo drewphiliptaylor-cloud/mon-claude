@@ -52,6 +52,15 @@ function tourPasse(item) {
   return el("div", { class: "claude" }, el("span", { class: "orbe" }, el("i")), corps);
 }
 
+// « claude-haiku-5-5 » → « Haiku 5.5 »
+const nomModele = id => { const m = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/.exec(id); return m ? `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}${m[3] ? "." + m[3] : ""}` : id; };
+
+// Modes de Claude Code (Maj+Tab dans le terminal, et ici dans la zone de saisie).
+const MODES = [["default", "Demander", "Claude demande ton accord avant chaque action sensible"],
+  ["acceptEdits", "Modifs auto", "Claude modifie les fichiers sans demander ; les commandes restent soumises à ton accord"],
+  ["plan", "Plan", "Claude explore et propose un plan, sans rien modifier, puis demande ton accord"],
+  ["auto", "Auto", "Un contrôle automatique accepte ou refuse chaque action ; les plus risquées te sont demandées"]];
+
 export async function pageConversation(vue, sessionId, projet = null) {
   const titre = el("h1", {}, sessionId ? "Conversation" : "Nouvelle conversation");
   const orbeHaut = el("span", { class: "orbe petite" }, el("i")), etatTxt = el("span", {}, ETATS.connexion);
@@ -64,9 +73,14 @@ export async function pageConversation(vue, sessionId, projet = null) {
     el("label", { class: "rond", title: "Joindre des images" }, ic("trombone"), el("span", { class: "sr" }, "Joindre des images"), fichier),
     el("label", { class: "sr", for: "texte" }, "Ton message"), texte,
     boutonMicro(texte), envoyer));
+  const choixModele = el("select", { class: "puce reglage-conv", "aria-label": "Modèle de Claude", title: "Modèle de Claude pour cette conversation" },
+    el("option", { value: "default" }, "Modèle par défaut"));
+  const choixMode = el("select", { class: "puce reglage-conv", "aria-label": "Mode de Claude", title: "Mode (Maj+Tab dans la zone de saisie pour passer au suivant)" },
+    MODES.map(([v, nom, aide]) => el("option", { value: v, title: aide }, nom)));
   const conteneur = el("div", { class: "conv" },
-    el("header", {}, titre, el("span", { class: "puce", title: "Dossier de travail de Claude" }, "…"), el("div", { class: "etat-conv", "aria-live": "polite" }, orbeHaut, etatTxt)),
-    fil, el("div", { class: "bas-conv" }, form, el("p", { class: "aide-conv" }, "Entrée pour envoyer · Maj+Entrée pour aller à la ligne · « / » pour les commandes")));
+    el("header", {}, titre, el("span", { class: "puce", title: "Dossier de travail de Claude" }, "…"), choixModele, choixMode,
+      el("div", { class: "etat-conv", "aria-live": "polite" }, orbeHaut, etatTxt)),
+    fil, el("div", { class: "bas-conv" }, form, el("p", { class: "aide-conv" }, "Entrée pour envoyer · Maj+Entrée pour aller à la ligne · « / » pour les commandes · Maj+Tab pour changer de mode")));
   vue.replaceChildren(conteneur);
   const puce = conteneur.querySelector(".puce");
   const enBas = () => { fil.scrollTop = fil.scrollHeight; };
@@ -77,7 +91,11 @@ export async function pageConversation(vue, sessionId, projet = null) {
       const c = await api(`/api/conversations/${sessionId}`);
       titre.textContent = c.titre || "Conversation";
       puce.textContent = (c.cwd || "").replace(/^\/Users\/[^/]+/, "~") || "~";
-      c.messages.forEach(m => filIn.append(m.role === "moi" ? bulleMoi(m.texte, null, m.images) : tourPasse(m)));
+      c.messages.forEach(m => {
+        const n = m.role === "moi" ? bulleMoi(m.texte, null, m.images) : tourPasse(m);
+        if (m.role === "moi") n.dataset.texte = (m.texte || "").trim();
+        filIn.append(n);
+      });
       enBas();
     } catch (e) { filIn.append(el("div", { class: "erreur-conv" }, e.message)); }
   } else puce.textContent = "~";
@@ -110,13 +128,29 @@ export async function pageConversation(vue, sessionId, projet = null) {
     });
     ici.addEventListener("message", m => { if (ws !== ici) return; let ev; try { ev = JSON.parse(m.data); } catch { return; } recevoir(ev); });
   }
+  // ---------- modèle et mode ----------
+  const regler = corps => { if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "regler", ...corps })); };
+  const afficherReglages = (modele, mode) => {
+    if (modele && ![...choixModele.options].some(o => o.value === modele)) choixModele.append(el("option", { value: modele }, modele));
+    if (modele) choixModele.value = modele;
+    if (mode) { choixMode.value = mode; choixMode.dataset.mode = mode; }
+  };
+  choixModele.addEventListener("change", () => regler({ modele: choixModele.value }));
+  choixMode.addEventListener("change", () => regler({ mode: choixMode.value }));
+  api("/api/modeles").then(({ modeles }) => {
+    const actuel = choixModele.value;
+    choixModele.replaceChildren(...modeles.map(m => el("option", { value: m.valeur, title: m.description }, m.nom)));
+    afficherReglages(actuel, null);
+  }).catch(() => { /* liste indisponible : « par défaut » reste proposé */ });
+  let enReprise = false;  // la page revient sur une réponse encore en cours
+
   etatApp.fermerConversation = () => { const w = ws; ws = null; try { w?.close(); } catch { /* déjà fermée */ } };
 
   // Nouvelle conversation : choix du dossier où Claude travaille (avant le premier message)
   if (!sessionId) {
     try {
       const { projets } = await api("/api/projets");
-      const choix = el("select", { class: "puce", "aria-label": "Dossier de travail de Claude", style: "border:0;font:inherit;font-size:var(--t11)" },
+      const choix = el("select", { class: "puce choix-dossier", "aria-label": "Dossier de travail de Claude", style: "border:0;font:inherit;font-size:var(--t11)" },
         el("option", { value: "" }, "Dossier personnel (~)"),
         projets.filter(p => p.dossier).map(p => el("option", { value: p.nom, selected: p.nom === projet }, `Projet ${p.nom.replace(/_/g, " ")}`)));
       choix.addEventListener("change", () => {
@@ -147,7 +181,22 @@ export async function pageConversation(vue, sessionId, projet = null) {
     tour.b.titre.textContent = `En cours · ${tour.nb} étape${tour.nb > 1 ? "s" : ""}`;
   }
   function recevoir(ev) {
+    if (ev.type === "reprise") { afficherReglages(ev.modele, ev.mode); enReprise = !!ev.occupe; return; }
+    if (ev.type === "reglages_conv") { afficherReglages(ev.modele, ev.mode); return; }
+    if (ev.type === "moi") {  // rejoué : le message de la réponse en cours
+      if (enReprise) {
+        // l'historique contient déjà le début de ce tour : on le remplace par la version en direct
+        const deja = [...filIn.children].reverse().find(n => n.dataset.texte !== undefined && n.dataset.texte === (ev.texte || "").trim());
+        if (deja) { while (deja.nextSibling) deja.nextSibling.remove(); deja.remove(); }
+        enReprise = false;
+      }
+      filIn.append(bulleMoi(ev.texte, ev.images)); dejaEcrit = true;
+      occupe = true; tour = nouveauTour(); majEnvoyer(); enBas(); return;
+    }
     if (ev.type === "session" && ev.id && ev.id !== sessionId) {  // nouvelle conversation, ou copie d'une conversation occupée ailleurs
+      // Filet de sécurité : la zone « nouvelle conversation » ne doit garder aucun message déjà envoyé
+      // (vu une fois en essai sans pouvoir le reproduire ensuite ; cause exacte non trouvée).
+      if (!sessionId && !texte.value.trim() && !jointes.length) effacerBrouillon(zoneBrouillon());
       sessionId = ev.id; etatApp.conversationActive = ev.id;
       history.replaceState(null, "", `#/conversation/${ev.id}`);
       return;
@@ -181,7 +230,8 @@ export async function pageConversation(vue, sessionId, projet = null) {
           const s = Math.max(1, Math.round((Date.now() - tour.debut) / 1000));
           if (tour.nb) { tour.b.titre.textContent = `A travaillé ${s} s · ${tour.nb} étape${tour.nb > 1 ? "s" : ""}`; tour.b.ouvrir(false); }
           else tour.b.p.remove();
-          tour.sous.textContent = heure(new Date());
+          // modèle qui a vraiment répondu (ex. le mode Plan de Claude Code passe de Haiku à Sonnet)
+          tour.sous.textContent = heure(new Date()) + (ev.modele ? " · " + nomModele(ev.modele) : "");
           if (tour.brut.trim()) tour.nom.append(boutonCopier(tour.brut));
           if (ev.erreur) tour.corps.append(el("div", { class: "erreur-conv" }, "Claude s'est arrêté sur une erreur."));
           prevenir(ev.erreur ? "Claude s'est arrêté sur une erreur" : "Claude a répondu", `${titre.textContent} · ${tour.brut}`, location.hash);
@@ -220,7 +270,16 @@ export async function pageConversation(vue, sessionId, projet = null) {
   ["dragleave", "drop"].forEach(t => form.addEventListener(t, e => { e.preventDefault(); form.classList.remove("survol"); }));
   form.addEventListener("drop", e => joindre([...(e.dataTransfer?.files || [])]));
   texte.addEventListener("input", () => { ajuster(); sauver(); });
-  texte.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); form.requestSubmit(); } });
+  texte.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); form.requestSubmit(); }
+    if (e.key === "Tab" && e.shiftKey) {  // comme dans Claude Code : passer au mode suivant
+      e.preventDefault();
+      const i = MODES.findIndex(([v]) => v === choixMode.value);
+      const suivant = MODES[(i + 1) % MODES.length][0];
+      afficherReglages(null, suivant); regler({ mode: suivant });
+      toast(`Mode : ${MODES.find(([v]) => v === suivant)[1]}`);
+    }
+  });
 
   form.addEventListener("submit", e => {
     e.preventDefault();
@@ -228,12 +287,13 @@ export async function pageConversation(vue, sessionId, projet = null) {
     if (occupe) { ws.send(JSON.stringify({ type: "interrompre" })); return; }
     const msg = texte.value.trim();
     if (!msg && !jointes.length) return;
-    dejaEcrit = true; conteneur.querySelector("select.puce")?.setAttribute("disabled", "");
-    effacerBrouillon(zoneBrouillon());
+    dejaEcrit = true; conteneur.querySelector("select.choix-dossier")?.setAttribute("disabled", "");
     filIn.append(bulleMoi(msg, jointes));
     ws.send(JSON.stringify({ type: "message", texte: msg, images: jointes.map(j => j.id) }));
     if (titre.textContent === "Nouvelle conversation" && msg) titre.textContent = msg.slice(0, 60);
-    jointes = []; dessinerPJ(); texte.value = ""; occupe = true; tour = nouveauTour(); ajuster(); enBas();
+    // Vider le champ AVANT dessinerPJ(), qui sauvegarde le brouillon : sinon le message envoyé y revenait.
+    texte.value = ""; jointes = []; dessinerPJ(); effacerBrouillon(zoneBrouillon());
+    occupe = true; tour = nouveauTour(); ajuster(); enBas();
   });
 
   if (etatApp.brouillon) { texte.value = etatApp.brouillon; etatApp.brouillon = ""; sauver(); }

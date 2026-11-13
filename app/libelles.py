@@ -28,6 +28,8 @@ def libelle(nom: str, entree: dict) -> str:
         return f"Consulte le web : {_court(entree.get('query') or entree.get('url'), 50)}"
     if nom in ("Task", "Agent"):
         return f"Délègue : {_court(entree.get('description'), 50)}"
+    if nom == "ExitPlanMode":
+        return "Propose son plan et demande ton accord pour passer à l'action"
     if nom == "Skill":
         return f"Utilise le skill {_court(entree.get('skill'), 40)}"
     if nom.startswith("mcp__"):

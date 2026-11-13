@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import agenda, commandes, dictee, historique, memoire, projets, quota, rapide, taches, travaux
-from .claude import Conversation
+from .claude import Conversation, liste_modeles
 from .config import Config
 from .securite import TAILLE_MAX_MESSAGE, requete_autorisee, type_image
 from .store import Store
@@ -29,6 +29,7 @@ WIDGETS = {"agenda", "todo", "reprendre", "projets", "quota", "date"}
 TAILLES = {"S", "M", "L", "XL"}
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 _UUID = re.compile(r"^[0-9a-f-]{36}$")
+_MODELE = re.compile(r"^[a-z0-9][a-z0-9.\-]{0,60}$")
 _IMAGE_ID = re.compile(r"^[0-9a-f]{32}\.(png|jpg|gif|webp)$")
 QUOTA_CACHE = 180  # secondes : au-delà, le pourcentage est redemandé à Claude Code
 
@@ -341,6 +342,31 @@ def creer_app(cfg: Optional[Config] = None) -> FastAPI:
         return {"pret": pret, "diagnostic": r.get("diagnostic"), "message": r["message"]}
 
     # ---------- conversation en direct ----------
+    vivantes: dict = {}          # session_id → Conversation encore ouverte côté serveur
+    taches_vivantes: set = set()  # tours en cours (référence gardée : sinon asyncio peut les oublier)
+
+    def noter_vivante(conv: Conversation) -> None:
+        if conv.ferme:
+            if conv.session_id and vivantes.get(conv.session_id) is conv:
+                del vivantes[conv.session_id]
+        elif conv.session_id:
+            vivantes[conv.session_id] = conv
+
+    @app.get("/api/modeles")
+    async def lister_modeles():
+        """Modèles proposés par Claude Code (gardés le temps de vie du serveur)."""
+        if modeles_cache["liste"] is None:
+            async with modeles_cache["verrou"]:
+                if modeles_cache["liste"] is None:
+                    try:
+                        modeles_cache["liste"] = await asyncio.wait_for(liste_modeles(str(cfg.interne)), 40)
+                    except Exception as e:
+                        print(f"liste des modèles indisponible : {e!r}", flush=True)
+                        return {"modeles": [{"valeur": "default", "nom": "Par défaut", "description": ""}]}
+        return {"modeles": modeles_cache["liste"]}
+
+    modeles_cache = {"liste": None, "verrou": asyncio.Lock()}
+
     @app.websocket("/ws/conversation")
     async def ws_conversation(ws: WebSocket):
         if not requete_autorisee(ws.headers.get("host"), ws.headers.get("origin"), cfg.port):
@@ -371,35 +397,57 @@ def creer_app(cfg: Optional[Config] = None) -> FastAPI:
             except Exception:
                 pass
 
-        conv = Conversation(envoyer, cwd=cwd, session_id=session_id, surveiller_quota=noter_quota,
-                            noter_commandes=noter_commandes)
-        taches_en_cours = set()
+        # Conversation encore vivante (réponse en cours alors que la page avait été quittée) : on s'y rattache.
+        conv = vivantes.get(session_id) if session_id else None
+        if conv is not None and not conv.ferme:
+            conv.attacher(envoyer)
+            await envoyer(conv.etat_pour_page())
+            for ev in list(conv.journal):  # le tour en cours, depuis le message envoyé
+                await envoyer(ev)
+        else:
+            conv = Conversation(envoyer, cwd=cwd, session_id=session_id, surveiller_quota=noter_quota,
+                                noter_commandes=noter_commandes, noter_session=noter_vivante)
+            await envoyer(conv.etat_pour_page())
         try:
             while True:
                 msg = await ws.receive_json()
                 genre = msg.get("type")
                 if genre == "message":
                     texte = str(msg.get("texte", ""))[:TAILLE_MAX_MESSAGE]
-                    images = []
+                    images, noms = [], []
                     for nom in (msg.get("images") or [])[:10]:
                         if isinstance(nom, str) and _IMAGE_ID.match(nom) and (cfg.images / nom).is_file():
                             donnees = (cfg.images / nom).read_bytes()
                             images.append((type_image(donnees)[0], base64.b64encode(donnees).decode()))
+                            noms.append(nom)
                     if not texte.strip() and not images:
                         continue
-                    t = asyncio.create_task(conv.tour(texte, images))
-                    taches_en_cours.add(t)
-                    t.add_done_callback(taches_en_cours.discard)
+                    bulle = {"images": [{"id": n, "url": f"/api/images/{n}", "nom": "image"} for n in noms]}
+                    # La tâche n'appartient pas à la page : elle continue si la page est quittée.
+                    t = asyncio.create_task(conv.tour(texte, images, bulle))
+                    taches_vivantes.add(t)
+                    t.add_done_callback(taches_vivantes.discard)
                 elif genre == "accord":
                     conv.repondre_accord(str(msg.get("id", "")), bool(msg.get("ok")))
                 elif genre == "interrompre":
                     await conv.interrompre()
+                elif genre == "regler":
+                    modele, mode = msg.get("modele"), msg.get("mode")
+                    if modele is not None and (not isinstance(modele, str) or not _MODELE.match(modele)):
+                        await envoyer({"type": "erreur", "message": "Modèle inconnu."})
+                        continue
+                    try:
+                        await conv.regler(modele=modele, mode=mode)
+                    except ValueError as e:
+                        await envoyer({"type": "erreur", "message": str(e)})
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
-            await conv.fermer()
-            for t in taches_en_cours:
-                t.cancel()
+            if conv._page is envoyer:  # une autre page a pu s'y rattacher entre-temps
+                conv.detacher()
+                if not conv.occupe:
+                    await conv.fermer()
+                # sinon : la réponse continue ; la conversation se libère seule à la fin du tour
 
     return app
 

@@ -28,6 +28,9 @@ from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions, ClaudeSDKCli
 from .libelles import etat as etat_outil, libelle
 
 DELAI_ACCORD = 600  # secondes avant de refuser une demande restée sans réponse
+# Modes de Claude Code proposés (Maj+Tab dans le terminal). « bypassPermissions » est exclu exprès :
+# il ferait tout sans jamais demander, ce qui contredit « rien sans validation ».
+MODES = ("default", "acceptEdits", "plan", "auto")
 
 Envoyer = Callable[[dict], Awaitable[None]]
 
@@ -37,6 +40,7 @@ class Traducteur:
 
     def __init__(self):
         self.texte_vu = False  # du texte est-il arrivé au fil de l'eau pendant ce tour ?
+        self.modele = None     # modèle qui a réellement répondu (le mode Plan peut en changer)
 
     def traduire(self, m) -> list:
         if isinstance(m, SystemMessage) and m.subtype == "commands_changed":
@@ -74,6 +78,8 @@ class Traducteur:
         if isinstance(m, AssistantMessage):
             if getattr(m, "parent_tool_use_id", None):
                 return []
+            if getattr(m, "model", None) and m.model != "<synthetic>":
+                self.modele = m.model
             return [{"type": "etape", "genre": "action", "texte": libelle(b.name, b.input or {})}
                     for b in m.content if isinstance(b, ToolUseBlock)]
         if isinstance(m, RateLimitEvent):
@@ -86,7 +92,9 @@ class Traducteur:
             if not self.texte_vu and m.result:
                 evs.append({"type": "texte", "delta": m.result})
             self.texte_vu = False
-            return evs + [{"type": "fin", "cout": m.total_cost_usd, "erreur": bool(m.is_error), "session": m.session_id},
+            modele, self.modele = self.modele, None
+            return evs + [{"type": "fin", "cout": m.total_cost_usd, "erreur": bool(m.is_error), "session": m.session_id,
+                           "modele": modele},
                           {"type": "etat", "etat": "pret"}]
         return []
 
@@ -100,10 +108,21 @@ def message_utilisateur(texte: str, images: list) -> dict:
 
 
 class Conversation:
-    def __init__(self, envoyer: Envoyer, cwd: str, session_id: Optional[str] = None,
+    """Une conversation vit indépendamment de la page : quitter la page ne coupe pas la réponse en cours.
+
+    La page s'y « attache » (attacher) et s'en « détache » (detacher). Pendant un tour, chaque événement est
+    aussi gardé dans un journal, rejoué à la page qui revient en cours de route.
+    """
+
+    def __init__(self, envoyer: Optional[Envoyer], cwd: str, session_id: Optional[str] = None,
                  surveiller_quota: Optional[Callable[[dict], None]] = None,
-                 noter_commandes: Optional[Callable[[dict], None]] = None):
-        self._envoyer = envoyer
+                 noter_commandes: Optional[Callable[[dict], None]] = None,
+                 noter_session: Optional[Callable[["Conversation"], None]] = None):
+        self._page: Optional[Envoyer] = envoyer
+        self._noter_session = noter_session
+        self.journal: list = []      # événements du tour en cours (pour une page qui revient)
+        self.modele: Optional[str] = None   # None = modèle par défaut de Claude Code
+        self.mode = "default"
         self._commandes = noter_commandes
         self._cwd = cwd
         self.session_id = session_id
@@ -112,6 +131,7 @@ class Conversation:
         self._accords: dict = {}
         self._traducteur = Traducteur()
         self.occupe = False
+        self.ferme = False
         self._copie = False          # reprendre dans une copie (la conversation tourne ailleurs)
         self._stderr: list = []      # dernières lignes d'erreur de Claude Code, pour des messages lisibles
 
@@ -119,8 +139,45 @@ class Conversation:
         return ClaudeAgentOptions(cwd=self._cwd, cli_path=shutil.which("claude"), include_partial_messages=True,
                                   setting_sources=["user", "project", "local"], can_use_tool=self._autorisation,
                                   resume=self.session_id, fork_session=self._copie,
+                                  model=self.modele, permission_mode=self.mode,
                                   stderr=self._noter_stderr,
                                   env={"MCP_CONNECTION_NONBLOCKING": "false"})  # connecteurs Google prêts dès le 1er message
+
+    # ---------- page attachée ----------
+    async def _envoyer(self, ev: dict) -> None:
+        if self.occupe:
+            self.journal.append(ev)
+        page = self._page
+        if page is not None:
+            await page(ev)
+
+    def attacher(self, envoyer: Envoyer) -> None:
+        self._page = envoyer
+
+    def detacher(self) -> None:
+        self._page = None
+
+    @property
+    def attachee(self) -> bool:
+        return self._page is not None
+
+    def etat_pour_page(self) -> dict:
+        return {"type": "reprise", "occupe": self.occupe, "modele": self.modele or "default", "mode": self.mode}
+
+    # ---------- modèle et mode ----------
+    async def regler(self, modele: Optional[str] = None, mode: Optional[str] = None) -> None:
+        """Change le modèle et/ou le mode ; s'applique tout de suite si Claude Code est déjà lancé."""
+        if mode is not None:
+            if mode not in MODES:
+                raise ValueError("Mode inconnu.")
+            self.mode = mode
+            if self._client is not None:
+                await self._client.set_permission_mode(mode)
+        if modele is not None:
+            self.modele = None if modele == "default" else modele
+            if self._client is not None:
+                await self._client.set_model(self.modele)
+        await self._envoyer({"type": "reglages_conv", "modele": self.modele or "default", "mode": self.mode})
 
     def _noter_stderr(self, ligne: str) -> None:
         if ligne.strip():
@@ -134,9 +191,9 @@ class Conversation:
         id_ = uuid.uuid4().hex[:10]
         futur = asyncio.get_running_loop().create_future()
         self._accords[id_] = futur
-        detail = (entree or {}).get("command") or (entree or {}).get("file_path") or ""
+        detail = (entree or {}).get("command") or (entree or {}).get("file_path") or (entree or {}).get("plan") or ""
         await self._envoyer({"type": "accord", "id": id_, "outil": nom, "texte": libelle(nom, entree or {}),
-                             "detail": str(detail)[:500]})
+                             "detail": str(detail)[:4000 if nom == "ExitPlanMode" else 500]})
         await self._envoyer({"type": "etat", "etat": "attend"})
         try:
             ok = await asyncio.wait_for(futur, DELAI_ACCORD)
@@ -144,6 +201,10 @@ class Conversation:
             ok = False
         finally:
             self._accords.pop(id_, None)
+        if ok and nom == "ExitPlanMode":
+            # Plan accepté : Claude Code sort du mode Plan ; on l'affiche (« Demander » est son mode de sortie).
+            self.mode = "default"
+            await self._envoyer({"type": "reglages_conv", "modele": self.modele or "default", "mode": self.mode})
         await self._envoyer({"type": "accord_fini", "id": id_, "ok": ok})
         await self._envoyer({"type": "etat", "etat": etat_outil(nom) if ok else "reflechit"})
         if ok:
@@ -157,11 +218,13 @@ class Conversation:
         futur.set_result(bool(ok))
         return True
 
-    async def tour(self, texte: str, images: Optional[list] = None) -> None:
+    async def tour(self, texte: str, images: Optional[list] = None, bulle: Optional[dict] = None) -> None:
+        """bulle : ce que la page affiche du message (texte, images) — rejoué si la page revient en cours de route."""
         if self.occupe:
             await self._envoyer({"type": "erreur", "message": "Claude répond déjà. Attends la fin ou interromps."})
             return
         self.occupe = True
+        self.journal = [{"type": "moi", "texte": texte, "images": (bulle or {}).get("images", [])}]
         try:
             for essai in (1, 2):
                 self._stderr = []
@@ -183,6 +246,9 @@ class Conversation:
                     break
         finally:
             self.occupe = False
+            self.journal = []
+            if self._page is None:
+                await self.fermer()  # personne ne regarde : la réponse est enregistrée par Claude Code, on libère
 
     async def _un_tour(self, texte: str, images: Optional[list]) -> None:
         if self._client is None:
@@ -209,6 +275,8 @@ class Conversation:
                 if ev["type"] == "session" and ev.get("id"):
                     self.session_id = ev["id"]
                     self._copie = False  # la copie a maintenant son propre identifiant : on la reprend normalement
+                    if self._noter_session:
+                        self._noter_session(self)
                 if ev["type"] == "quota" and self._quota:
                     self._quota(ev)
                 if ev["type"] in ("commandes", "commandes_desc"):
@@ -232,7 +300,27 @@ class Conversation:
                 pass
 
     async def fermer(self) -> None:
+        self.ferme = True
         for futur in list(self._accords.values()):
             if not futur.done():
-                futur.set_result(False)  # page fermée : on refuse proprement
+                futur.set_result(False)  # conversation libérée : on refuse proprement
         await self._fermer_client()
+        if self._noter_session:
+            self._noter_session(self)
+
+
+async def liste_modeles(cwd: str) -> list:
+    """Modèles que Claude Code propose à ce compte (comme le sélecteur /model du terminal)."""
+    client = ClaudeSDKClient(options=ClaudeAgentOptions(cwd=cwd, cli_path=shutil.which("claude"), setting_sources=[],
+                                                        extra_args={"no-session-persistence": None}))
+    await client.connect()
+    try:
+        info = await client.get_server_info() or {}
+    finally:
+        await client.disconnect()
+    sortie = []
+    for m in info.get("models") or []:
+        if isinstance(m, dict) and isinstance(m.get("value"), str):
+            nom = "Par défaut" if m["value"] == "default" else str(m.get("displayName") or m["value"])
+            sortie.append({"valeur": m["value"], "nom": nom, "description": str(m.get("description") or "")})
+    return sortie or [{"valeur": "default", "nom": "Par défaut", "description": ""}]

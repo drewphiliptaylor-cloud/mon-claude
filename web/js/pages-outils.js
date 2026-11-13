@@ -23,6 +23,7 @@ export async function pageOutils(vue) {
 const GESTES = [
   ["Dans ce dashboard", [
     ["Entrée", "Envoyer le message"], ["Maj + Entrée", "Aller à la ligne"],
+    ["Maj + Tab", "Dans une conversation : passer au mode suivant (Demander → Modifs auto → Plan → Auto)"],
     ["/", "En début de message : ouvrir le menu des commandes (flèches + Entrée pour choisir, Échap pour fermer)"],
     ["Micro", "Clic pour dicter, clic pour arrêter : le texte s'ajoute sans être envoyé"],
     ["Carré (pendant une réponse)", "Interrompre Claude"], ["Échap", "Fermer une fenêtre ou une proposition"],

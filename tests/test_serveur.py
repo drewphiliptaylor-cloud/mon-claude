@@ -142,3 +142,14 @@ def test_prenom_enregistre_et_valide(client):
     assert client.get("/api/reglages").json()["prenom"] == "Alex"
     for mauvais in ["x" * 31, "A\nB", 12, None]:
         assert client.put("/api/reglages/prenom", json={"valeur": mauvais}).status_code == 400, mauvais
+
+
+def test_reglage_de_conversation_valide(client):
+    with client.websocket_connect("ws://127.0.0.1:8765/ws/conversation", headers={"Origin": "http://127.0.0.1:8765"}) as ws:
+        assert ws.receive_json() == {"type": "reprise", "occupe": False, "modele": "default", "mode": "default"}
+        ws.send_json({"type": "regler", "mode": "acceptEdits", "modele": "opus"})
+        assert ws.receive_json() == {"type": "reglages_conv", "modele": "opus", "mode": "acceptEdits"}
+        ws.send_json({"type": "regler", "modele": "../../etc"})
+        assert ws.receive_json()["type"] == "erreur"
+        ws.send_json({"type": "regler", "mode": "bypassPermissions"})
+        assert ws.receive_json() == {"type": "erreur", "message": "Mode inconnu."}

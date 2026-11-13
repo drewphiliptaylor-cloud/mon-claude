@@ -26,6 +26,15 @@ Le serveur lance `/usage` de Claude Code (commande locale, ne consomme pas de qu
 toutes les 3 minutes. Secours : `~/.dashboard-claude/quota.json`, écrit par `~/.claude/statusline.py` quand
 un terminal Claude Code est ouvert.
 
+## Conversations : modèle, mode, page quittée
+- En haut de chaque conversation : le **modèle** (liste fournie par Claude Code) et le **mode**
+  (Demander, Modifs auto, Plan, Auto ; `Maj+Tab` dans la saisie pour passer au suivant). Le mode
+  « tout autoriser » de Claude Code n'est volontairement pas proposé.
+- Sous chaque réponse : l'heure et le modèle qui a **réellement** répondu (en mode Plan, Claude Code
+  peut passer à un modèle plus puissant que celui choisi).
+- Quitter la page pendant une réponse ne l'arrête plus : elle continue sur le Mac. En revenant, la réponse
+  en cours reprend en direct ; si elle est finie, elle est dans l'historique.
+
 ## Notifications
 Réglages → Notifications → « Me prévenir ». Prévient quand Claude a répondu ou attend ton accord, si tu es
 sur une autre fenêtre. La page doit rester ouverte. Rien ne s'affiche ? Réglages Système → Notifications → ton navigateur.
